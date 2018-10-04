@@ -160,7 +160,7 @@ o) Compiling the SystemTap module
   
   Example for kernel version 2.6.32-220.el6.x86_64:
   
-      $ stap -r 2.6.32-220.el6.x86_64 netapp_nfsmon.stp –m netapp_nfsmon_2_6_32_220_el6_x86_64
+      $ stap -r 2.6.32-220.el6.x86_64 netapp_nfsmon.stp â€“m netapp_nfsmon_2_6_32_220_el6_x86_64
   
   Note that dots and dashes must be replaced with underscores in the compiled
   module name (the value following the -m parameter). This is necessary due
