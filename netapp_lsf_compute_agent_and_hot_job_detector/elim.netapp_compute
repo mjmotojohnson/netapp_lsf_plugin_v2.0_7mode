@@ -1,0 +1,680 @@
+#!/usr/bin/python
+
+
+#################################################################
+#                                                               #
+# Copyright (c) 2013 NetApp, Inc. All rights reserved.          #
+# Specifications subject to change without notice.              #
+#                                                               #
+# netapp_lsf_compute_agent.py - Python script that invokes a    #
+#       SystemTap module and monitors NFS performance           #
+#       statistics. These statistics are tied to LSF job        #
+#       numbers and then written to text files to serve as a    #
+#       log of how much NFS work an LSF job did.                #
+#                                                               #
+#       This script is meant to be invoked on the LSF compute   #
+#       nodes by configuring it as an ELIM in LSF.              #
+#                                                               #
+#       Reads a configuration file named                        #
+#       "netapp_lsf_compute_agent.conf" from the same           #
+#       directory as this script.                               #
+#                                                               #
+#       The parameters of the configuration file are as         #
+#       follows:                                                #
+#                                                               #
+#           [main]                                              #
+#                                                               #
+#           ; The directory containing the compiled SystemTap   #
+#           ; module (.ko file) for the kernel version.         #
+#           systemtap_modules_directory = /path/to/dir          #
+#                                                               #
+#           ; Output directory for the LSF job report text      #
+#           ; files.                                            #
+#           job_report_output_directory = /path/to/dir          #
+#                                                               #
+#           ; How often (in seconds) LSF job performance data   #
+#           ; should be written to text files. Between these    #
+#           ; output intervals, the performance data is         #
+#           ; aggregated into periods.                          #
+#           performance_output_write_interval = 30              #
+#                                                               #
+#           ; Period of inactivity (in seconds) after which,    #
+#           ; if activity occurs, the LSF job number for the    #
+#           ; PID should be updated.                            #
+#           pid_to_lsf_job_number_expiration_time = 60          #
+#                                                               #
+#           ; How often (in seconds) to update the LSF cluster  #
+#           ; name of which the compute node is a member.       #
+#           cluster_name_fetch_interval = 600                   #
+#                                                               #
+#           ; How often (in seconds) to update the list of      #
+#           ; mount points connected to the compute node.       #
+#           mount_point_fetch_interval = 600                    #
+#                                                               #
+#           ; Number of times to attempt to restart the         #
+#           ; SystemTap process if it should exit               #
+#           ; unexpectedly. A value of -1 indicates unlimited   #
+#           ; restart attempts.                                 #
+#           max_systemtap_restarts = 10                         #
+#                                                               #
+#################################################################
+
+
+import subprocess, re, logging, logging.handlers, sys, os, time, platform, socket, select
+from ConfigParser import ConfigParser
+from threading import Timer, Thread
+from Queue import Queue, Empty
+
+# Initialize the logger for this script. Outputs to the /var/log directory.
+logger = logging.getLogger('netapp_lsf_compute_agent')
+handler = logging.handlers.TimedRotatingFileHandler('/var/log/netapp_lsf_compute_agent.log', when='midnight', interval=1, backupCount=7)
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.DEBUG)
+
+
+
+# Custom exception raised when problems are encountered starting the
+# SystemTap module subprocess.
+class SystemTapProcessException(Exception):
+	pass
+
+
+# Class to store the number of different types of NFS operations for a
+# given process.
+class OperationCounter(object):
+	def __init__(self):
+		self.operations = {}
+		self.operations['RD'] = 0
+		self.operations['WR'] = 0
+		
+	def __str__(self):
+		return str(self.operations)
+		
+	def __repr__(self):
+		return repr(self.operations)
+	
+
+# Main class for this script to handle running SystemTap and processing
+# performance data output.
+class ComputeNodeAgent(object):
+	clusterName = None
+	pidToLSFJobNumberMap = {}
+	pidLastUsedTimeMap = {}
+	deviceNumberToDeviceMap = {}
+	nonNFSDeviceMap = {}
+	outputMonitoringThread = None
+	outputQueue = {}
+	
+	properties = {}
+	
+	# Initializes properties of this class.
+	def __init__(self):
+		# Make sure we're running on Linux.
+		if not sys.platform.startswith('linux'):
+			logger.critical('This agent can only be run on Linux. Exiting.')
+			sys.exit(1)
+		
+		# Detect the distribution.
+		self.distName, self.distVersion, self.distID = platform.linux_distribution()
+		
+		# Detect the kernel version.
+		self.kernelVersion = os.uname()[2]
+		
+		# Detect the hostname.
+		self.hostname = socket.gethostname()
+		
+		if not self.distName or not self.kernelVersion or not self.hostname:
+			# Failed to detect necessary platform information.
+			logger.critical('Failed to detect platform information for this node. Cannot continue.')
+			sys.exit(1)
+	
+	
+	# Runs the SystemTap module as a subprocess of this script. The
+	# stdout output from SystemTap will be captured and processed
+	# by this script.
+	def runSystemTapModule(self, attempts=1, delay=0):
+		if attempts < 1:
+			return
+		
+		kernelVersion = self.getKernelVersion()
+		# Convert the special characters in the kernel version string
+		# to underscores. Compiled SystemTap module names can only
+		# contain letters, numbers, and underscores.
+		convertedKernelVersion = kernelVersion.replace('.', '_').replace('-', '_')
+		systemTapCompiledModulesDirectory = self.properties['systemtap_modules_directory']
+		if not systemTapCompiledModulesDirectory.endswith(os.sep):
+			systemTapCompiledModulesDirectory += os.sep
+		
+		systemTapModuleName = 'netapp_nfsmon_' + convertedKernelVersion + '.ko'
+		modulePath = systemTapCompiledModulesDirectory + systemTapModuleName
+		
+		# Check if the compiled SystemTap module file for the kernel
+		# version is present at the configured location.
+		if not os.path.isfile(modulePath):
+			logger.error('Unable to locate SystemTap module for host kernel version %s in directory %s. Ensure SystemTap module has been compiled for this kernel version and saved at %s.' % (kernelVersion, systemTapCompiledModulesDirectory, modulePath))
+			raise SystemTapProcessException()
+		
+		# Start the SystemTap module subprocess.
+		logger.info('Starting SystemTap module: ' + modulePath)
+		onPOSIX = 'posix' in sys.builtin_module_names
+		process = None
+		failureEncountered = False
+		
+		# Attempt to start the SystemTap module. If it doesn't start
+		# successfully, retry the specified number of times, waiting
+		# the specified delay between attempts, before giving up.
+		for i in xrange(attempts):
+			if failureEncountered:
+				if delay > 0:
+					logger.info('Waiting %f seconds before attempting restart of SystemTap module.')
+					time.sleep(delay)
+				logger.info('Attempt %d to start SystemTap module: %s' % (i + 1, modulePath))
+				
+			try:
+				# Attempt to kill a currently-installed copy of the
+				# module. This can occur if the subprocess exits
+				# unexpectedly or if the elim is restarted.
+				killProcess = subprocess.Popen(['staprun', '-d', modulePath], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+				killProcess.wait()
+				
+				# Start the SystemTap module.
+				process = subprocess.Popen(['staprun', modulePath], stdout=subprocess.PIPE, bufsize=1, close_fds=onPOSIX)
+				if process:
+					exitCode = process.poll()
+					if exitCode:
+						logger.error('SystemTap process immediately exited with code %d.' % (exitCode))
+					else:
+						# Process started successfully and is still running. Return the process object.
+						logger.info('SystemTap module started successfully.')
+						return process
+				else:
+					# Process did not start, but no OSError was raised.
+					logger.error('Unknown error starting SystemTap process.')
+			except OSError as e:
+				logger.error('Error starting SystemTap process: %s' % (e.strerror))
+				
+			failureEncountered = True
+				
+		# Getting here means the SystemTap module didn't start
+		# successfully. Raise an exception.
+		raise SystemTapProcessException()
+		
+	
+	# Retrieves the kernel version for this compute node by calling
+	# "uname -r".
+	def getKernelVersion(self):
+		process = subprocess.Popen(['uname', '-r'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		output, errors = process.communicate()
+		
+		if len(errors) > 0:
+			logger.critical('Failed to read uname -r output to retrieve kernel version.')
+			sys.exit(1)
+		
+		kernelVersion = output.strip()
+		return kernelVersion
+	
+	
+	# Monitors the output from the SystemTap process. Waits for output
+	# to be available and then calls the method to process the line of
+	# output.
+	#
+	# Sample output:
+	# -----------------------------
+	# RD 2685 0:6 403
+	# RD 2659 0:6 1
+	# WR 15911 0:19 1
+	# -----------------------------
+	# RD 2664 0:6 261
+	# RD 2685 0:6 423
+	# RD 2659 0:6 6
+	# WR 15911 0:6 1
+	# WR 15919 0:6 1
+	#
+	# in the format:
+	# <operation> <PID> <device> <count>
+	def monitorSystemTapOutput(self, process):
+		separationString = '-----------------------------'
+		
+		outputQueue = Queue()
+		
+		lastCheckTime = time.time()
+		elapsedTime = 0
+		
+		# Keep track of how many times the SystemTap module has stopped
+		# running.
+		failureCount = 0
+		maxSystemTapRestarts = int(self.properties['max_systemtap_restarts'])
+		
+		# We will use the UNIX-specific select module's poll object to
+		# check if the SystemTap process's stdout has data to prevent
+		# doing a blocking readline() call.
+		pollObj = select.poll()
+		pollObj.register(process.stdout, select.POLLIN)
+		
+		while True:
+			# Check if the SystemTap process has died.
+			exitCode = process.poll()
+			if exitCode:
+				failureCount += 1
+				
+				if maxSystemTapRestarts < 0 or maxSystemTapRestarts > failureCount:
+					logger.error('The SystemTap process has exited unexpectedly with code %d. It has stopped running %d time(s). Restarting SystemTap module.' % (exitCode, failureCount))
+					
+					process = self.runSystemTapModule(attempts=2, delay=5)
+					pollObj = select.poll()
+					pollObj.register(process.stdout, select.POLLIN)
+					
+					time.sleep(1.0)
+					continue
+				else:
+					logger.error('The SystemTap process has exited unexpectedly with code %d. It has stopped running %d time(s) and maximum restart attempts is %d. Giving up.' % (exitCode, failureCount, maxSystemTapRestarts))
+					raise SystemTapProcessException()
+			
+			# Check if there is data to read from the SystemTap
+			# process's stdout.
+			pollResult = pollObj.poll(0)
+			if pollResult:
+				line = process.stdout.readline()
+				if line.strip() != separationString:
+					# Process the SystemTap output line.
+					self.processSystemTapOutput(line.strip())
+			else:
+				# No output from SystemTap at this time.
+				
+				# Check to see if we should write out the data during
+				# times when there is no SystemTap output to process.
+				currentTime = time.time()
+				timeDifference = currentTime - lastCheckTime
+				if timeDifference < 0:
+					# The system time has been set back. Trigger a write.
+					self.writeJobStatistics()
+				else:
+					elapsedTime += timeDifference
+					
+					if elapsedTime > int(self.properties['performance_output_write_interval']):
+						self.writeJobStatistics()
+						self.outputQueue.clear()
+						elapsedTime = 0
+						
+				lastCheckTime = currentTime
+				
+				time.sleep(1.0)
+			
+	
+	# Writes the queued LSF job performance statistics to text files in
+	# the specified output directory. If the file already exists (in
+	# the case of updating a file for a running LSF job), the queued
+	# data is appended to the end of the file.
+	def writeJobStatistics(self):
+		if len(self.outputQueue) < 1:
+			logger.info('No LSF job data to write. Skipping update.')
+			return
+			
+		logger.debug('Writing LSF job data.')
+		
+		outputDirectory = self.properties['job_report_output_directory']
+		
+		# Create the directories for the output files if it does not exist.
+		if not os.path.exists(outputDirectory):
+			os.makedirs(outputDirectory)
+		
+		timestamp = str(int(round(time.time(), 0)))
+		
+		logger.info('Writing job report data to: %s' %(outputDirectory))
+		logger.debug('Job report data: %s' %(self.outputQueue))
+		
+		for lsfJobNumber, deviceOperationMap in self.outputQueue.items():
+			filename = str(lsfJobNumber) + '-' + self.clusterName + '.txt'
+			filepath = outputDirectory + os.sep + filename
+			
+			# Check to see if the file exists. If not, we will write a
+			# header when we create the file with information on the
+			# file contents.
+			fileExists = os.path.exists(filepath)
+			
+			# Open file for appending.
+			f = open(filepath, 'a')
+			
+			if not fileExists:
+				# Write a file header.
+				f.write(('NetApp LSF Compute Agent Job Report - Format:  <timestamp_in_seconds_since_epoch>, '
+						 'followed by  a newline, followed by one or more performance lines in '
+						 'the form "<controller:/vol/vol_name>,RD,WR" where RD is '
+						 'the NFS Read operation count and WR is the NFS Write '
+						 'operation count.\n'))
+			
+			# Write the timestamp.
+			f.write(timestamp + "\n")
+			
+			# Write the operation data.
+			for device, operationCounter in deviceOperationMap.items():
+				reads = operationCounter.operations['RD']
+				writes = operationCounter.operations['WR']
+				f.write(device + ',' + str(reads) + ',' + str(writes) + "\n")
+			
+			f.close()
+	
+	
+	# Processes a line of output from the SystemTap module. Finds the
+	# LSF job number for the PID, and, if it is indeed an LSF job,
+	# stores the NFS operation count in the output queue.
+	def processSystemTapOutput(self, line):
+		# Sample output line:
+		# RD 15911 0:19 14
+		regex = '(\w+)\s(\d+)\s((\d+):(\d+))\s(\d+)'
+		m = re.search(regex, line)
+		operation = m.group(1)
+		pid = m.group(2)
+		deviceID = m.group(3)
+		majorDevice = m.group(4)
+		minorDevice = m.group(5)
+		operationCount = m.group(6)
+		
+		# Check to see if we know what device this is. If not, refersh
+		# the device map.
+		# 
+		# If, after refreshing, we find the device is not an NFS
+		# device, cache that information along with an expiry time.
+		if deviceID not in self.deviceNumberToDeviceMap:
+			currentTime = time.time()
+			
+			if deviceID in self.nonNFSDeviceMap:
+				# We previously cached the fact that this device is not
+				# an NFS device. If this cache entry is recent enough,
+				# don't do another device list refresh.
+				cacheEntryTime = self.nonNFSDeviceMap[deviceID]
+				if currentTime - cacheEntryTime < int(self.properties['non_nfs_device_cache_expiration_time']):
+					return
+			
+			# This is either a new, unknown device, or it's a device
+			# that we previously marked as non-NFS but sufficiently
+			# long ago to warrant checking again. Refresh the list
+			# of NFS devices.
+			self.deviceNumberToDeviceMap = self.getDeviceNumberToDeviceMap()
+			
+			# Now that we've refreshed the NFS device list, check to
+			# see if it's an NFS device.
+			if deviceID not in self.deviceNumberToDeviceMap:
+				# Not an NFS device. Cache this information and then
+				# return from this function, not processing this line
+				# of SystemTap data.
+				self.nonNFSDeviceMap[deviceID] = currentTime
+				return
+			
+		logger.debug('Processing line:  ' + line)
+		
+		clockTime = time.time()
+		
+		if pid in self.pidToLSFJobNumberMap:
+			lastUsedTime = self.pidLastUsedTimeMap[pid]
+			elapsedTime = clockTime - lastUsedTime
+			
+			# Eventually PIDs will be re-used, but there should be
+			# a significant amount of time that passes after the
+			# process has finished before the PID is used again.
+			# Keep track of the last time we processed a PID and
+			# if enough time has passed, we will assume that
+			# the PID may now be a different process and get the
+			# LSF job number again.
+			#
+			# Elapsed time can be negative if the system time has
+			# been set backwards. In that case, just update the
+			# LSF job number.
+			if elapsedTime < 0 or elapsedTime > int(self.properties['pid_to_lsf_job_number_expiration_time']):
+				# Cache entry is expired. Update the LSF job number.
+				lsfJobNumber = self.findLSFJobNumberForPID(pid)
+				self.pidToLSFJobNumberMap[pid] = lsfJobNumber
+			else:
+				# Cache hit. The stored LSF job number is still valid.
+				lsfJobNumber = self.pidToLSFJobNumberMap[pid]
+			
+		else:
+			lsfJobNumber = self.findLSFJobNumberForPID(pid)
+			self.pidToLSFJobNumberMap[pid] = lsfJobNumber
+		
+		# Update the stored time we've last seen the PID to the
+		# current time.
+		self.pidLastUsedTimeMap[pid] = clockTime
+		
+		if lsfJobNumber is None:
+			logger.debug('PID ' + str(pid) + ' does not appear to be an LSF job. Skipping processing.')
+		else:
+			device = self.deviceNumberToDeviceMap[deviceID]
+			
+			if lsfJobNumber not in self.outputQueue:
+				self.outputQueue[lsfJobNumber] = {}
+			if device not in self.outputQueue[lsfJobNumber]:
+				self.outputQueue[lsfJobNumber][device] = OperationCounter()
+					
+			self.outputQueue[lsfJobNumber][device].operations[operation] += int(operationCount)
+	
+	
+	# Attempts to find the LSF job number for the passed-in PID. Uses
+	# the "ps" command to retrieve the PPID and command for the
+	# passed-in PID and its parent processes. If the parent process's
+	# command matches the LSF command format, the LSF job number is
+	# extracted from the command. Returns None if the given PID isn't
+	# part of an LSF job.
+	def findLSFJobNumberForPID(self, pid):
+		# Construct the PPID tree for the process.
+		pids = []
+		pidToCommandMap = {}
+		currentPID = str(pid)
+		pids.append(currentPID)
+		
+		while len(currentPID) > 0:
+			
+			process = subprocess.Popen(['ps', '-p', str(currentPID), '-o', 'ppid=', '-o', 'command='], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+			output, errors = process.communicate()
+			
+			if len(errors) > 0:
+				logger.debug('Failed to retrieve PPID and command for PID ' + currentPID + ' using ps command.')
+				return None
+			
+			regex = '\s*(\d+)\s*(.*)'
+			m = re.search(regex, output)
+			
+			if m is None:
+				logger.debug('Failed to retrieve PPID and command for PID ' + currentPID + ' using ps command.')
+				return None
+			else:
+				ppid = m.group(1)
+				command = m.group(2)
+				
+				pidToCommandMap[currentPID] = command
+				
+				if ppid == '0':
+					break
+				
+				pids.append(ppid)
+				currentPID = ppid
+			
+			
+		if len(pids) < 5:
+			# This isn't an LSF job. An LSF job process will always have
+			# a process tree of at least a depth of 5.
+			return None
+		else:
+			# Read the command for the parent of the base LSF job process
+			# to retrieve the LSF job number.
+			immediateParentPID = pids[-4]
+			immediateParentCommand = pidToCommandMap[immediateParentPID]
+			
+			# Example command:
+			# /bin/sh /home/lsfadmin/.lsbatch/1349365117.650
+			regex = '.*\/\d+\.(\d+)$'
+			m = re.search(regex, immediateParentCommand)
+			
+			if m is None:
+				lsfJobNumber = None
+			else:
+				lsfJobNumber = m.group(1)
+				logger.debug('Found LSF job number for PID ' + str(pid) + ':  ' + str(lsfJobNumber))
+		
+		return lsfJobNumber
+	
+	
+	# Calls the method to retrieve the LSF cluster name and then starts
+	# a timer to call this method again after the specified interval.
+	def updateLSFClusterName(self):
+		self.clusterName = self.getLSFClusterName()
+		Timer(int(self.properties['cluster_name_fetch_interval']), self.updateLSFClusterName).start()
+		
+	
+	# Retrieves the name of the LSF cluster of which this compute node
+	# is a member. Calls the "lsid" command to retrieve this name.
+	def getLSFClusterName(self):
+		logger.debug('Retrieving LSF cluster name.')
+		
+		process = subprocess.Popen(['lsid'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		output, errors = process.communicate()
+		
+		if len(errors) > 0:
+			logger.critical('Failed to read LSF cluster name with "lsid" command.')
+			sys.exit(1)
+		
+		regex = 'My cluster name is (.*)'
+		m = re.search(regex, output)
+		clusterName = m.group(1)
+		
+		logger.debug('Found LSF cluster name: ' + clusterName)
+		
+		return clusterName
+	
+	
+	# Calls the method to read the NFS mount points and their device
+	# numbers and then starts a timer to call this method again
+	# after the specified interval.
+	def updateDeviceNumberToDeviceMap(self):
+		self.deviceNumberToDeviceMap = self.getDeviceNumberToDeviceMap()
+		Timer(int(self.properties['mount_point_fetch_interval']), self.updateDeviceNumberToDeviceMap).start()
+
+
+	# Reads the output of the "mount" UNIX command to construct a map
+	# of local mount points to the mounted device.
+	def getDeviceNumberToDeviceMap(self):
+		logger.debug('Retrieving device number map.')
+		
+		process = subprocess.Popen(['mount'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		output, errors = process.communicate()
+		
+		if len(errors) > 0:
+			logger.critical('Failed to read mounts with "mounts" command.')
+			sys.exit(1)
+		
+		# Sample output line from "mount" command:
+		# fas3070rre2:/vol/vol_lsf1 on /mnt/fas3070rre2/vol_lsf1 type nfs (rw,addr=10.61.167.241)
+		regex = '(\S*) on (\S*) type (\S*) \((.*)\)'
+		
+		mountPointsToDevice = {}
+		
+		mountLines = output.strip().split("\n")
+		for line in mountLines:
+			m = re.search(regex, line)
+			device = m.group(1)
+			localMountPoint = m.group(2)
+			mountType = m.group(3)
+			mountArguments = m.group(4)
+			
+			if mountType != 'nfs':
+				continue
+		
+			mountPointsToDevice[localMountPoint] = device
+		
+		
+		# Retrieve the device number for each NFS mount using the "mountpoint" command.
+		deviceNumberToDeviceMap = {}
+		
+		for mountPoint, device in mountPointsToDevice.items():
+			process = subprocess.Popen(['mountpoint', '-d', mountPoint], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+			output, errors = process.communicate()
+			
+			if len(errors) > 0:
+				logger.critical('Failed to read mounts with "mounts" command.')
+				sys.exit(1)
+			
+			# The output should be the device number, like this:
+			# 0:19
+			# majorDeviceNumber, minorDeviceNumber = output.strip().split(':')
+			deviceNumber = output.strip()
+			deviceNumberToDeviceMap[deviceNumber] = device
+		
+		logger.debug('Retrieved device number map: ' + str(deviceNumberToDeviceMap))
+		return deviceNumberToDeviceMap
+	
+	
+	# Reads the configuration file for this script to load properties.
+	def readConfigurationFile(self, configurationFilePath):
+		logger.info('Reading configuration file at %s.' % (configurationFilePath))
+		
+		properties = {}
+		
+		# Load the default values into the property map. These will be
+		# overwritten when reading the properties file.
+		properties['systemtap_modules_directory'] = '.'
+		properties['job_report_output_directory'] = '.'
+		properties['performance_output_write_interval'] = '30'
+		properties['pid_to_lsf_job_number_expiration_time'] = '60'
+		properties['cluster_name_fetch_interval'] = '600'
+		properties['mount_point_fetch_interval'] = '600'
+		properties['non_nfs_device_cache_expiration_time'] = '600'
+		properties['max_systemtap_restarts'] = '10'
+		
+		config = ConfigParser()
+		try:
+			config.read(configurationFilePath)
+			for option in config.options('MAIN'):
+				try:
+					optionValue = config.get('MAIN', option)
+					properties[option] = optionValue
+					logger.info('Read property file value: key = %s, value = %s' % (option, optionValue))
+				except:
+					# Keep the default value. Perform no action.
+					pass
+		except:
+			logger.warning('Could not read configuration file at %s. Using default values.' % (configurationFilePath))
+		
+		return properties
+		
+	
+	# The main "run" method for this class. Starts the SystemTap module
+	# and begins monitoring and processing its output.
+	def run(self):
+		# Restore the working directory to its state when the script
+		# was executed.
+		#os.chdir(scriptWorkingDirectory)
+
+		# Retrieve the directory of this script file.
+		scriptDir = os.path.dirname(os.path.realpath(__file__))
+		configurationFilePath = scriptDir + os.sep + 'netapp_lsf_compute_agent.conf'
+		self.properties = self.readConfigurationFile(configurationFilePath)
+		
+		# Start the repeating thread to update the LSF cluster name
+		# of which this compute node is a member.
+		self.updateLSFClusterName()
+		
+		# Start the repeating thread to update the map storing
+		# device numbers to devices.
+		self.updateDeviceNumberToDeviceMap()
+		
+		# Start the SystemTap module running.
+		try:
+			process = self.runSystemTapModule(attempts=2, delay=10)
+		except SystemTapProcessException:
+			logger.error('Failed to start SystemTap. See previous log messages for more information. Exiting.')
+			sys.exit(0)
+		
+		# Start processing the SystemTap output.
+		try:
+			self.monitorSystemTapOutput(process)
+		except SystemTapProcessException:
+			logger.error('SystemTap has unexpectedly stopped functioning. Exiting.')
+			sys.exit(0)
+	
+	
+if __name__ == '__main__':
+	agent = ComputeNodeAgent()
+	agent.run()
+	

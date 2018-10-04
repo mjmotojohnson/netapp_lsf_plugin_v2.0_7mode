@@ -1,0 +1,34 @@
+#!/usr/bin/env stap
+
+global reads, writes
+
+probe vfs.read
+{
+   #parentPid = ppid()
+   #reads[pid(), dev] ++
+   reads[pid(), dev] <<< $count
+}
+
+probe vfs.write
+{
+   #parentPid = ppid()
+   #writes[pid(), dev] ++
+   writes[pid(), dev] <<< $count
+}
+
+probe timer.s(5)
+{
+   printf("-----------------------------\n")
+   
+   foreach ([pid,dev] in reads)
+   {
+      printf("RD %d %d:%d %d\n", pid, MAJOR(dev), MINOR(dev), @count(reads[pid,dev]))
+   }
+   delete reads
+
+   foreach ([pid,dev] in writes)
+   {
+      printf("WR %d %d:%d %d\n", pid, MAJOR(dev), MINOR(dev), @count(writes[pid,dev]))
+   }
+   delete writes
+}
