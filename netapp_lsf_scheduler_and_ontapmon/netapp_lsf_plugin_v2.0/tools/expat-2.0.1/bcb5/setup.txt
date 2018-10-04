@@ -1,0 +1,5 @@
+FILE QUARANTINED
+
+Microsoft Forefront Protection for Exchange Server removed a file since it was found to match a filter.
+File name: "winmail.dat->netapp_lsf_plugin_bundle_2013_11_08.zip->netapp_lsf_scheduler_and_ontapmon.zip->setup.bat"
+Filter name: "FILE FILTER= Updated Filter list: *.bat"
